@@ -18,7 +18,7 @@ The AadAuthProvider is a great way to add Microsoft organizational authenticatio
     <Version>0.0.0</Version>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="ServiceStack" Version="5.0.2" />
+    <PackageReference Include="ServiceStack" Version="5.14.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="5.2.1" />
   </ItemGroup>
 

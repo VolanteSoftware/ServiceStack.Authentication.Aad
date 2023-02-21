@@ -5,12 +5,12 @@ using ServiceStack.Web;
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
-using System.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
-using System.IO;
 using System.Net;
-using System.Reflection;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+#pragma warning disable CS1998
 
 namespace ServiceStack.Authentication.Aad
 {
@@ -152,7 +152,7 @@ namespace ServiceStack.Authentication.Aad
             // and the base implementation does not naturally support that
         }
 
-        public override object Authenticate(IServiceBase authService, IAuthSession session, Authenticate request)
+        public override async Task<object> AuthenticateAsync(IServiceBase authService, IAuthSession session, Authenticate request, CancellationToken cancellationToken = default)
         {
             // TODO: WARN: Property 'redirect' does not exist on type 'ServiceStack.Authenticate'
             // TODO: WARN: Property 'code' does not exist on type 'ServiceStack.Authenticate'
@@ -163,6 +163,8 @@ namespace ServiceStack.Authentication.Aad
             var tokens = Init(authService, ref session, request);
             var httpRequest = authService.Request;
             var query = httpRequest.QueryString;
+
+            var authContext = CreateAuthContext(authService, session, tokens);
             if (HasError(query))
                 return RedirectDueToFailure(authService, session, query);
 
@@ -177,7 +179,7 @@ namespace ServiceStack.Authentication.Aad
 
             var code = query["code"];
             if (code.IsNullOrEmpty())
-                return RequestCode(authService, session, userSession, tokens);
+                return await RequestCode(authService, session, userSession, tokens, authContext);
 
             var state = query["state"];
             if (state != userSession.State)
@@ -193,10 +195,11 @@ namespace ServiceStack.Authentication.Aad
             //    Azure AD token issuance endpoint. It presents the authorization code 
             //    to prove that the user has consented.
 
-            return RequestAccessToken(authService, session, code, tokens);
+            return await RequestAccessToken(authService, session, code, tokens, authContext, cancellationToken);
         }
 
-        private object RequestCode(IServiceBase authService, IAuthSession session, AuthUserSession userSession, IAuthTokens tokens)
+        private async Task<object> RequestCode(IServiceBase authService, IAuthSession session,
+            AuthUserSession userSession, IAuthTokens tokens, AuthContext authContext)
         {
             var state = Guid.NewGuid().ToString("N");
             userSession.State = state;
@@ -206,18 +209,19 @@ namespace ServiceStack.Authentication.Aad
                 codeRequest += "&domain_hint=" + DomainHint;
             if (!tokens.UserName.IsNullOrEmpty())
                 codeRequest += "&login_hint=" + tokens.UserName;
-            authService.SaveSession(session, SessionExpiry);
-            return authService.Redirect(PreAuthUrlFilter(this, codeRequest));
+            await authService.SaveSessionAsync(session, SessionExpiry);
+
+            return authService.Redirect(PreAuthUrlFilter(authContext, codeRequest));
         }
 
-        private IHttpResult RequestAccessToken(IServiceBase authService, IAuthSession session, string code, IAuthTokens tokens)
+        private async Task<IHttpResult> RequestAccessToken(IServiceBase authService, IAuthSession session, string code, IAuthTokens tokens, AuthContext authContext, CancellationToken cancellationToken)
         {
             try
             {
                 var formData = "client_id={0}&redirect_uri={1}&client_secret={2}&code={3}&grant_type=authorization_code&resource={4}"
                     .Fmt(ClientId.UrlEncode(), CallbackUrl.UrlEncode(), ClientSecret.UrlEncode(), code, ResourceId.UrlEncode());
                 // Endpoint only accepts posts requests
-                var contents = AccessTokenUrl.PostToUrl(formData);
+                var contents = await AccessTokenUrl.PostToUrlAsync(formData, token: cancellationToken);
 
                 // 4. The Azure AD token issuance endpoint returns an access token 
                 //    and a refresh token. The refresh token can be used to request 
@@ -230,8 +234,8 @@ namespace ServiceStack.Authentication.Aad
                     return RedirectDueToFailure(authService, session, authInfoNvc);
                 tokens.AccessTokenSecret = authInfo["access_token"];
                 tokens.RefreshToken = authInfo["refresh_token"];
-                return OnAuthenticated(authService, session, tokens, authInfo.ToDictionary())
-                       ?? authService.Redirect(SuccessRedirectUrlFilter(this, session.ReferrerUrl.SetParam("s", "1"))); //Haz Access!
+                return await OnAuthenticatedAsync(authService, session, tokens, authInfo.ToDictionary(), cancellationToken)
+                       ?? authService.Redirect(SuccessRedirectUrlFilter(authContext, session.ReferrerUrl.SetParam("s", "1"))); //Haz Access!
             }
             catch (WebException webException)
             {
@@ -247,7 +251,7 @@ namespace ServiceStack.Authentication.Aad
                 Log.Error("Auth Failure", webException);
                 var response = ((HttpWebResponse) webException.Response);
                 var responseText = Encoding.UTF8.GetString(
-                    response.GetResponseStream().ReadFully());
+                    await response.GetResponseStream().ReadFullyAsync(cancellationToken));
                 var errorInfo = JsonObject.Parse(responseText).ToNameValueCollection();
                 return RedirectDueToFailure(authService, session, errorInfo);
             }
@@ -257,22 +261,24 @@ namespace ServiceStack.Authentication.Aad
         /// <summary>
         /// Returns a redirect result to a Microsoft logout page
         /// </summary>
-        public IHttpResult RedirectToMicrosoftLogout(IServiceBase authService)
+        public IHttpResult RedirectToMicrosoftLogout(IServiceBase authService, AuthContext authContext)
         {
             // See https://msdn.microsoft.com/en-us/office/office365/howto/authentication-v2-protocols
             var request = "{0}logout?client_id={1}&post_logout_redirect_uri={2}"
                 .Fmt(BaseAuthUrl, ClientId, CallbackUrl.UrlEncode());
-            return authService.Redirect(LogoutUrlFilter(this, request));
+            return authService.Redirect(LogoutUrlFilter(authContext, request));
         }
 
-        public override object Logout(IServiceBase service, Authenticate request)
+        public override async Task<object> LogoutAsync(IServiceBase service, Authenticate request, CancellationToken token = new CancellationToken())
         {
-            base.Logout(service, request);
-            return RedirectToMicrosoftLogout(service);
+            return RedirectToMicrosoftLogout(service, CreateAuthContext(service, await service.GetSessionAsync(token: token)));
         }
 
-        public override IHttpResult OnAuthenticated(IServiceBase authService, IAuthSession session, IAuthTokens tokens, Dictionary<string, string> authInfo)
+        public override async Task<IHttpResult> OnAuthenticatedAsync(IServiceBase authService, IAuthSession session, IAuthTokens tokens, Dictionary<string, string> authInfo,
+            CancellationToken token = new CancellationToken())
         {
+            var authContext = CreateAuthContext(authService, session, tokens);
+
             try
             {
                 // The id_token is a JWT token. See http://jwt.io
@@ -310,7 +316,7 @@ namespace ServiceStack.Authentication.Aad
                     // Because Microsoft will continue to send us the same token without prompting
                     // the user for other credentials.
                     // TODO: It would be nice to momentarily show the user a message explaining why they are being signed out
-                    return RedirectToMicrosoftLogout(authService);
+                    return RedirectToMicrosoftLogout(authService, authContext);
                 }
             }
             catch (Exception ex)
@@ -320,23 +326,24 @@ namespace ServiceStack.Authentication.Aad
                     {
                         {"error", "bad-jwt"},
                         {"error_description", "Problem checking the JWT token"}
-                    });                
+                    });
             }
-            return base.OnAuthenticated(authService, session, tokens, authInfo);
+            return await base.OnAuthenticatedAsync(authService, session, tokens, authInfo, token);
         }
 
-        protected override void LoadUserAuthInfo(AuthUserSession userSession, IAuthTokens tokens, Dictionary<string, string> authInfo)
+        protected override async Task LoadUserAuthInfoAsync(AuthUserSession userSession, IAuthTokens tokens, Dictionary<string, string> authInfo,
+            CancellationToken token = new CancellationToken())
         {
             try
             {
                 var jwt = new JwtSecurityToken(authInfo["id_token"]);
                 var p = jwt.Payload;
-                tokens.UserId = (string) p["oid"];
-                tokens.UserName = (string) p["upn"];
-                tokens.LastName = (string) p.GetValueOrDefault("family_name");
-                tokens.FirstName = (string) p.GetValueOrDefault("given_name");
-                tokens.DisplayName = (string) p.GetValueOrDefault("name") ?? tokens.FirstName + " " + tokens.LastName;
-                tokens.Email = (string) p.GetValueOrDefault("email");
+                tokens.UserId = (string)p["oid"];
+                tokens.UserName = (string)p["upn"];
+                tokens.LastName = (string)p.GetValueOrDefault("family_name");
+                tokens.FirstName = (string)p.GetValueOrDefault("given_name");
+                tokens.DisplayName = (string)p.GetValueOrDefault("name") ?? tokens.FirstName + " " + tokens.LastName;
+                tokens.Email = (string)p.GetValueOrDefault("email");
                 tokens.RefreshTokenExpiry = jwt.ValidTo;
                 if (SaveExtendedUserInfo)
                     p.Each(x => authInfo[x.Key] = x.Value.ToString());
@@ -375,7 +382,7 @@ namespace ServiceStack.Authentication.Aad
                 baseUrl + FailureRedirectPath :
                 session.ReferrerUrl ?? baseUrl;
             var fparam = errorInfo["error"] ?? "Unknown";
-            return authService.Redirect(FailedRedirectUrlFilter(this, destination.SetParam("f", fparam)));
+            return authService.Redirect(FailedRedirectUrlFilter(CreateAuthContext(authService, session), destination.SetParam("f", fparam)));
         }
 
         private void FailAndLogError(IAuthSession session, NameValueCollection errorInfo)
